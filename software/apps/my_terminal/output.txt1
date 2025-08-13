@@ -1,0 +1,1143 @@
+Part 1
+/*
+===============================================================================
+DVI Terminal Emulator for RP2350 / Pico2
+===============================================================================
+
+Overview:
+This project emulates a retro-style terminal using the Raspberry Pi RP2350's
+built-in DVI capabilities. Output is rendered in crisp 640×480 VGA resolution,
+with support for ANSI sequences, color themes, cursor styles, directional control,
+and character-level rendering—all synchronized at the frame level for flicker-free
+visuals.
+
+Key Features:
+- 80×30 character grid using fixed 8×16 monospaced font
+- RGB222 color encoding (64 foreground + 64 background values)
+- Frame-safe buffer swapping for glitch-free scroll and updates
+- Blinking cursor styles with selectable glyphs (Apple II, Bar, Underline, Apple I)
+- Live theme selection via control keys and menu popup
+- Fully functional cursor style menu rendered with box drawing and buffer save/restore
+- Direct foreground color control via Ctrl keys
+- Supports multi-parameter ANSI escape sequences
+- Arrow key input via ESC[A/B/C/D sequences with cursor bounds checking
+- Saved/restored cursor location via ESC[s / ESC[u]
+- Erase-to-end-of-line functionality via ESC[K
+
+===============================================================================
+Control Key Bindings:
+===============================================================================
+→ Theme Selection:
+    Press Ctrl+T to enter theme select mode.
+    Then press a number key (1–9) to apply a theme from the list below.
+
+→ Cursor Style Menu:
+    Press Ctrl+M to open the cursor style selection menu.
+    Inside the menu, press keys 1–4 to select:
+        [1] Apple II     → ]  classic bracket
+        [2] Underline    → _
+        [3] Bar          → |
+        [4] Apple I      → @  block-style
+
+→ Direct Foreground Color Controls:
+    Ctrl+G  → Green         (fg:12, bg unchanged)
+    Ctrl+W  → Bright White  (fg:63)
+    Ctrl+B  → Blue
+    Ctrl+C  → Cyan
+    Ctrl+D  → Dark Green
+    Ctrl+O  → Orange
+    Ctrl+R  → Red
+    Ctrl+S  → Magenta
+    Ctrl+Y  → Yellow
+    Ctrl+L  → Light Gray
+
+===============================================================================
+Available Themes (Ctrl+T, then press 1–9):
+===============================================================================
+    [1] IBM GreenScreen      → fg:12,  bg:0
+    [2] VT Amber             → fg:60,  bg:0
+    [3] ANSI Cyan            → fg:15,  bg:5
+    [4] DOS Classic          → fg:63,  bg:0
+    [5] Electric Blue        → fg:3,   bg:0
+    [6] Mainframe Red        → fg:48,  bg:21
+    [7] Magenta Spark        → fg:51,  bg:0
+    [8] Matrix Inverse       → fg:0,   bg:12
+    [9] Teal & Indigo        → fg:6,   bg:11
+
+===============================================================================
+Supported ANSI Escape Sequences (Partial CSI Implementation):
+===============================================================================
+→ Cursor Movement:
+    ESC[H              → Moves cursor to home (top-left)
+    ESC[row;colH       → Moves cursor to specified position (1-based indexing)
+    ESC[A              → Moves cursor up (stops at top row)
+    ESC[B              → Moves cursor down (stops at bottom row)
+    ESC[C              → Moves cursor right (stops at screen edge)
+    ESC[D              → Moves cursor left (stops at column 0)
+    ESC[s              → Saves current cursor position
+    ESC[u              → Restores saved cursor position
+
+→ Screen Manipulation:
+    ESC[2J             → Clears entire screen and resets cursor
+
+→ Line Manipulation:
+    ESC[K              → Clears from cursor to end of line
+
+→ Text Attributes:
+    ESC[0m             → Resets to default colors
+    ESC[30–37m         → Set foreground color
+    ESC[40–47m         → Set background color
+    ESC[31;47m         → Example: Red text on white background
+
+Notes:
+- All sequences follow standard ESC[...final format
+- Maximum parameter count: 4
+- Final characters must match known dispatch ty
+
+Part 2
+pes: H, J, K, m, s, u, A–D
+- Unknown or unsupported codes are safely ignored
+
+===============================================================================
+Rendering Architecture:
+===============================================================================
+- Character buffer holds active screen state
+- Color buffer is split into 3 packed RGB planes
+- Font scanlines preprocessed during init (reverse mirrored for codepoints < 128)
+- Core 1 handles TMDS pixel encoding and sync-safe frame output
+- Core 0 handles input events, cursor blinking, and buffer edits
+
+===============================================================================
+Author Notes:
+- Designed for RP2350-based boards using PicoDVI
+- Optimized for speed, minimal memory usage, and authenticity
+- Cursor style and themes are extensible for personalization
+- ANSI parser supports real-time character handling with escape sequencing
+- Future support may include ESC[1K / ESC[2K, reverse video, bold text, and scroll regions
+*/
+
+#include <stdio.h>
+#include "hardware/uart.h"
+#define UART_ID uart0
+#define UART_TX_PIN 0
+#define UART_RX_PIN 1
+//#define BAUD_RATE 115200
+#define BAUD_RATE 19200
+#include "pico/i2c_slave.h" 
+#define I2C_SLAVE i2c1 
+#define I2C_SDA_PIN 26 
+#define I2C_SCL_PIN 27 
+#define I2C_SLAVE_ADDR 0x55 
+#define I2C_BAUD_RATE 100000
+#define LED_PIN 25  // Pico 2 rp2350
+#include <stdlib.h>
+#include <string.h>
+#include "pico/stdlib.h"
+#include "pico/multicore.h"
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+#include "hardware/vreg.h"
+#include "hardware/structs/bus_ctrl.h"
+#include "hardware/dma.h"
+#include "dvi.h"
+#include "dvi_serialiser.h"
+#ifndef DVI_DEFAULT_SERIAL_CONFIG
+#define DVI_DEFAULT_SERIAL_CONFIG adafruit_hdmi_sock_cfg
+#endif
+#include "common_dvi_pin_configs.h"
+#include "tmds_encode_font_2bpp.h"
+#include "font_8x16.h"
+
+
+// === Terminal Configuration ===
+#define FONT_CHAR_WIDTH 8
+#define FONT_CHAR_HEIGHT 16
+#define FONT_N_CHARS 256
+//#define FONT_N_CHARS 128
+
+#define FRAME_WIDTH 640
+#define FRAME_HEIGHT 480
+#define VREG_VSEL VREG_VOLTAGE_1_20
+#define DVI_TIMING dvi_timing_640x480p_60hz
+
+#define CHAR_COLS (FRAME_WIDTH / FONT_CHAR_WIDTH)
+#define CHAR_ROWS (FRAME_HEIGHT / FONT_CHAR_HEIGHT)
+#define COLOUR_PLANE_SIZE_WORDS (CHAR_ROWS * CHAR_COLS * 4 / 32)
+#define COLOUR_PAD_WORDS 8
+
+bool cursor_drawn = false;
+bool suppress_swap_frame = false;
+int saved_cursor_x = -1;
+int saved_cursor_y = -1;
+int cursor_draw_x = -1;
+int cursor_draw_y = -1;
+
+struct dvi_inst dvi0;
+static uint8_t font_scanline[FONT_N_CHARS * FONT_CHAR_HEIGHT];
+
+// === Buffers ===
+__attribute__((aligned(4))) static char charbuf_front[CHAR_ROWS * CHAR_COLS];
+__attribute__((aligned(4))) static char charbuf_back[CHAR_ROWS * CHAR_COLS];
+__attribute__((
+    aligned(4))) static uint32_t colourbuf_front[3 * COLOUR_PLANE_SIZE_WORDS + COLOUR_PAD_WORDS];
+__attribute__((
+    aligned(4))) static uint32_t colourbuf_back[3 * COLOUR_PLANE_SIZE_WORDS + COLOUR_PAD_WORDS];
+
+static volatile bool buffer_lock = false;
+static volatile bool swap_pending = false;
+static volatile bool scroll_swap_requested = false;
+
+// === State ===
+uint8_t current_fg = 12;
+uint8_t current_bg = 0;
+
+char saved_cursor_char = ' ';
+uint8_t saved_cursor_fg = 0;
+uint8_t saved_cursor_bg = 0;
+
+typedef struct {
+    uint16_t cursor_x;
+    uint16_t cursor_y;
+    bool cursor_visible;
+    bool escape_mode;
+    bool ansi_mode;
+    bool skip_next_lf;
+} terminal_state_t;
+
+terminal_state_t term;
+
+#define MENU_BUFFER_WIDTH 34 // Width of the boxed menu area
+#define MENU_BUFFER_HEIGHT 10
+
+char saved_chars[MENU_BUFFER_HEIGHT][MENU_BUFFER_WIDTH];
+uint8_t saved_fg[MENU_BUFFER_HEIGHT][MENU_BUFFER_WIDTH];
+uint8_t saved_bg[MENU_BUFFER_HEIGHT][MENU_BUFFER_WIDTH];
+
+volatile bool scroll_requested = false;
+uint16_t menu_left = 0;
+uint16_t menu_top = 0;
+
+volatile bool theme_select_mode = false;
+volatile bool cursor_menu_mode = false;
+volatile absolute_time_t led_off_time;
+volatile absolute_time_t next_cursor_blink;
+
+// === Cursor Styles ===
+enum curs
+
+Part 3
+or_style { CURSOR_APPLE_II, CURSOR_UNDERLINE, CURSOR_BAR, CURSOR_APPLE_I };
+enum cursor_style current_cursor = CURSOR_APPLE_II;
+
+// === ANSI Parsing Support ===
+#define ANSI_PARAM_MAX 4
+uint8_t ansi_params[ANSI_PARAM_MAX];
+uint8_t ansi_param_count = 0;
+uint8_t ansi_param_index = 0;
+char ansi_buffer[16];
+uint8_t ansi_buf_len = 0;
+char ansi_final_char = '\0';
+
+// extern const char pacman_sprite[8][8] = {
+//     {' ', '#', '#', '#', '#', '#', ' ', ' '},
+//     {'#', '#', '#', '#', '#', '#', '#', ' '},
+//     {'#', '#', '#', ' ', ' ', '#', '#', ' '},
+//     {'#', '#', ' ', ' ', ' ', '#', '#', ' '},
+//     {'#', '#', ' ', ' ', ' ', '#', '#', ' '},
+//     {'#', '#', '#', ' ', ' ', '#', '#', ' '},
+//     {'#', '#', '#', '#', '#', '#', '#', ' '},
+//     {' ', '#', '#', '#', '#', '#', ' ', ' '}
+// };
+//
+// extern const char pacman_sprite_alt[8][8] = {
+//     {' ', '#', '#', '#', '#', '#', ' ', ' '},
+//     {'#', '#', '#', '#', '#', '#', '#', ' '},
+//     {'#', '#', '#', '#', '#', '#', '#', ' '},
+//     {'#', '#', '#', '#', '#', '#', '#', ' '},
+//     {'#', '#', '#', '#', '#', '#', '#', ' '},
+//     {'#', '#', '#', '#', '#', '#', '#', ' '},
+//     {'#', '#', '#', '#', '#', '#', '#', ' '},
+//     {' ', '#', '#', '#', '#', '#', ' ', ' '}
+// };
+
+// uint8_t pac_x = 30, pac_y = 10;
+// bool pac_anim_toggle = true;
+
+void reset_ansi_state(void) {
+    ansi_param_count = 0;
+    ansi_param_index = 0;
+    ansi_buf_len = 0;
+    ansi_final_char = '\0';
+}
+
+void request_swap(void) {
+    swap_pending = true;
+}
+
+void set_char(uint x, uint y, char c) {
+    if (x < CHAR_COLS && y < CHAR_ROWS)
+        charbuf_back[x + y * CHAR_COLS] = c;
+}
+
+void set_colour(uint x, uint y, uint8_t fg, uint8_t bg) {
+    if (x >= CHAR_COLS || y >= CHAR_ROWS)
+        return;
+    uint idx = x + y * CHAR_COLS;
+    uint bit = (idx % 8) * 4;
+    uint word = idx / 8;
+
+    for (int p = 0; p < 3; ++p) {
+        uint32_t val = (fg & 0x3) | ((bg << 2) & 0xC);
+        colourbuf_back[word + p * COLOUR_PLANE_SIZE_WORDS] =
+            (colourbuf_back[word + p * COLOUR_PLANE_SIZE_WORDS] & ~(0xFu << bit)) | (val << bit);
+        fg >>= 2;
+        bg >>= 2;
+    }
+}
+
+void clear_screen(void) {
+    while (__atomic_test_and_set(&buffer_lock, __ATOMIC_ACQUIRE)) {}
+
+    // 🔴 Prevent red flicker: zero out color buffer before applying colors
+    memset(colourbuf_back, 0, sizeof(colourbuf_back));
+
+    memset(charbuf_back, ' ', sizeof(charbuf_back));
+    for (uint y = 0; y < CHAR_ROWS; y++) {
+        for (uint x = 0; x < CHAR_COLS; x++) {
+            set_colour(x, y, current_fg, current_bg);
+        }
+    }
+
+    term.cursor_x = term.cursor_y = 0;
+
+    __atomic_clear(&buffer_lock, __ATOMIC_RELEASE);
+    sleep_ms(16);  // Roughly one frame at 60Hz
+    suppress_swap_frame = true;
+    request_swap();
+}
+
+void process_ansi_code(uint8_t param) {
+    if (param == 0) {
+        current_fg = 63;
+        current_bg = 0;
+    } else if (param >= 30 && param <= 37)
+        current_fg = param - 30 + 1;
+    else if (param >= 40 && param <= 47)
+        current_bg = param - 40 + 1;
+}
+
+void process_ansi_sequence(uint8_t *params, uint8_t count, char final) {
+    switch (final) {
+    case 'J': // Clear screen
+        if (count == 1 && params[0] == 2)
+            clear_screen();
+        break;
+
+    case 'K': // Erase line from cursor to end
+        for (uint x = term.cursor_x; x < CHAR_COLS; x++) {
+            set_char(x, term.cursor_y, ' ');
+            set_colour(x, term.cursor_y, current_fg, current_bg);
+        }
+        break;
+
+    case 'H': // Move cursor
+        if (count >= 1)
+            term.cursor_y = (params[0] > 0 ? params[0] - 1 : 0);
+        if (count >= 2)
+            term.cursor_x = (params[1] > 0 ? params[1] - 1 : 0);
+        break;
+
+    case 'm': // Text attributes
+        for (uint8_t i = 0; i < count; i++) {
+            process_ansi_code(params[i]);
+        }
+        break;
+
+    case 's': // Save cursor position
+        // set_char(term.cursor_x, term.cursor_y, ' ');
+        // set_colour(term.cursor_x, t
+
+Part 4
+erm.cursor_y, current_fg, current_bg);
+        saved_cursor_x = term.cursor_x;
+        saved_cursor_y = term.cursor_y;
+        break;
+
+    case 'u': // Restore cursor position
+        // set_char(term.cursor_x, term.cursor_y, ' ');
+        // set_colour(term.cursor_x, term.cursor_y, current_fg, current_bg);
+        term.cursor_x = saved_cursor_x;
+        term.cursor_y = saved_cursor_y;
+        break;
+
+    case 'A': {
+        if (term.cursor_y > 0) {
+            if (cursor_drawn) {
+                set_char(term.cursor_x, term.cursor_y, saved_cursor_char);
+                set_colour(term.cursor_x, term.cursor_y, saved_cursor_fg, saved_cursor_bg);
+                cursor_drawn = false;
+            }
+
+            term.cursor_y--;
+
+            uint idx = term.cursor_x + term.cursor_y * CHAR_COLS;
+            saved_cursor_char = charbuf_back[idx];
+            uint bit = (idx % 8) * 4;
+            uint word = idx / 8;
+
+            uint8_t fg = 0, bg = 0;
+            for (int p = 2; p >= 0; --p) {
+                uint32_t val = colourbuf_back[word + p * COLOUR_PLANE_SIZE_WORDS];
+                uint8_t nibble = (val >> bit) & 0xF;
+                fg = (fg << 2) | (nibble & 0x3);
+                bg = (bg << 2) | ((nibble >> 2) & 0x3);
+            }
+
+            saved_cursor_fg = fg;
+            saved_cursor_bg = bg;
+
+            term.cursor_visible = false;
+            next_cursor_blink = delayed_by_us(get_absolute_time(), 500000);
+            request_swap();
+        }
+        break;
+    }
+
+    case 'B': {
+        if (term.cursor_y + 1 < CHAR_ROWS) {
+            if (cursor_drawn) {
+                set_char(term.cursor_x, term.cursor_y, saved_cursor_char);
+                set_colour(term.cursor_x, term.cursor_y, saved_cursor_fg, saved_cursor_bg);
+                cursor_drawn = false;
+            }
+
+            term.cursor_y++;
+
+            uint idx = term.cursor_x + term.cursor_y * CHAR_COLS;
+            saved_cursor_char = charbuf_back[idx];
+            uint bit = (idx % 8) * 4;
+            uint word = idx / 8;
+
+            uint8_t fg = 0, bg = 0;
+            for (int p = 2; p >= 0; --p) {
+                uint32_t val = colourbuf_back[word + p * COLOUR_PLANE_SIZE_WORDS];
+                uint8_t nibble = (val >> bit) & 0xF;
+                fg = (fg << 2) | (nibble & 0x3);
+                bg = (bg << 2) | ((nibble >> 2) & 0x3);
+            }
+
+            saved_cursor_fg = fg;
+            saved_cursor_bg = bg;
+
+            term.cursor_visible = false;
+            next_cursor_blink = delayed_by_us(get_absolute_time(), 500000);
+            request_swap();
+        }
+        break;
+    }
+
+    case 'C': {
+        if (term.cursor_x + 1 < CHAR_COLS) {
+            if (cursor_drawn) {
+                set_char(term.cursor_x, term.cursor_y, saved_cursor_char);
+                set_colour(term.cursor_x, term.cursor_y, saved_cursor_fg, saved_cursor_bg);
+                cursor_drawn = false;
+            }
+
+            term.cursor_x++;
+
+            // Refresh saved character and color
+            uint idx = term.cursor_x + term.cursor_y * CHAR_COLS;
+            saved_cursor_char = charbuf_back[idx];
+            uint bit = (idx % 8) * 4;
+            uint word = idx / 8;
+
+            uint8_t fg = 0, bg = 0;
+            for (int p = 2; p >= 0; --p) {
+                uint32_t val = colourbuf_back[word + p * COLOUR_PLANE_SIZE_WORDS];
+                uint8_t nibble = (val >> bit) & 0xF;
+                fg = (fg << 2) | (nibble & 0x3);
+                bg = (bg << 2) | ((nibble >> 2) & 0x3);
+            }
+
+            saved_cursor_fg = fg;
+            saved_cursor_bg = bg;
+
+            term.cursor_visible = false;
+            next_cursor_blink = delayed_by_us(get_absolute_time(), 500000);
+            request_swap();
+        }
+        break;
+    }
+
+    case 'D': {
+        if (term.cursor_x > 0) {
+            if (cursor_drawn) {
+                set_char(term.cursor_x, term.cursor_y, saved_cursor_char);
+                set_colour(term.cursor_x, term.cursor_y, saved_
+
+Part 5
+cursor_fg, saved_cursor_bg);
+                cursor_drawn = false;
+            }
+
+            term.cursor_x--;
+
+            uint idx = term.cursor_x + term.cursor_y * CHAR_COLS;
+            saved_cursor_char = charbuf_back[idx];
+            uint bit = (idx % 8) * 4;
+            uint word = idx / 8;
+
+            uint8_t fg = 0, bg = 0;
+            for (int p = 2; p >= 0; --p) {
+                uint32_t val = colourbuf_back[word + p * COLOUR_PLANE_SIZE_WORDS];
+                uint8_t nibble = (val >> bit) & 0xF;
+                fg = (fg << 2) | (nibble & 0x3);
+                bg = (bg << 2) | ((nibble >> 2) & 0x3);
+            }
+
+            saved_cursor_fg = fg;
+            saved_cursor_bg = bg;
+
+            term.cursor_visible = false;
+            next_cursor_blink = delayed_by_us(get_absolute_time(), 500000);
+            request_swap();
+        }
+        break;
+    }
+    }
+}
+
+// === Utilities ===
+uint8_t reverse_byte(uint8_t b) {
+    b = (b >> 4 | b << 4);
+    b = ((b & 0xCC) >> 2) | ((b & 0x33) << 2);
+    b = ((b & 0xAA) >> 1) | ((b & 0x55) << 1);
+    return b;
+}
+
+void restore_menu_region(void) {
+    for (uint8_t row = 0; row < MENU_BUFFER_HEIGHT; row++) {
+        for (uint8_t col = 0; col < MENU_BUFFER_WIDTH; col++) {
+            uint px = menu_left + col;
+            uint py = menu_top + row;
+            if (px < CHAR_COLS && py < CHAR_ROWS) { // ✅ Screen bounds check
+                set_char(px, py, saved_chars[row][col]);
+                set_colour(px, py, saved_fg[row][col], saved_bg[row][col]);
+            }
+        }
+    }
+    request_swap();
+}
+
+void draw_cursor_menu(void) {
+    uint16_t x = 2; // X position for content inside box
+    uint16_t y;
+
+    // 🌟 Clamp Y so menu doesn't overflow screen
+    if (term.cursor_y + MENU_BUFFER_HEIGHT + 1 < CHAR_ROWS) {
+        y = term.cursor_y + 1;
+    } else {
+        y = CHAR_ROWS - MENU_BUFFER_HEIGHT - 1;
+    }
+
+    // 📝 Menu content
+    const char *lines[] = {"Cursor Style Menu:", "[1] Apple II ]", "[2] Underline _",
+                           "[3] Bar |",          "[4] Apple I @",  "Select style: "};
+    size_t num_lines = sizeof(lines) / sizeof(lines[0]);
+
+    uint8_t box_width = 32;
+    uint8_t box_height = num_lines + 2; // top/bottom borders
+
+    uint16_t left = x - 1;
+    uint16_t top = y - 1;
+
+    // Save for later restore
+    menu_left = left;
+    menu_top = top;
+
+    // Save region contents before drawing
+    for (uint8_t row = 0; row < MENU_BUFFER_HEIGHT; row++) {
+        for (uint8_t col = 0; col < MENU_BUFFER_WIDTH; col++) {
+            uint px = left + col;
+            uint py = top + row;
+            if (px < CHAR_COLS && py < CHAR_ROWS) {
+                saved_chars[row][col] = charbuf_back[px + py * CHAR_COLS];
+
+                // Extract color info
+                uint idx = px + py * CHAR_COLS;
+                uint bit = (idx % 8) * 4;
+                uint word = idx / 8;
+
+                uint8_t fg = 0, bg = 0;
+                for (int p = 2; p >= 0; --p) {
+                    uint32_t val = colourbuf_back[word + p * COLOUR_PLANE_SIZE_WORDS];
+                    uint8_t nibble = (val >> bit) & 0xF;
+                    fg = (fg << 2) | (nibble & 0x3);
+                    bg = (bg << 2) | ((nibble >> 2) & 0x3);
+                }
+
+                saved_fg[row][col] = fg;
+                saved_bg[row][col] = bg;
+            }
+        }
+    }
+
+    // Draw box borders using ASCII
+    set_char(left, top, '+'); // Top-left
+    for (uint8_t i = 0; i < box_width; i++)
+        set_char(x + i, top, '-');        // Top
+    set_char(left + box_width, top, '+'); // Top-right
+
+    for (uint8_t i = 0; i < box_height - 2; i++) {
+        set_char(left, y + i, '|');             // Left
+        set_char(left + box_width, y + i, '|'); // Right
+    }
+
+    set_char(left, top + box_height - 1, '+'); // Bottom-left
+    for (uint8_t i = 0; i < box_width; i++)
+        set_char(x + i, top + box_height - 1, '-');        // Bottom
+    set_char(left + box_width, top + box_height - 1, '+')
+
+Part 6
+; // Bottom-right
+
+    // Write menu lines inside the box
+    for (size_t i = 0; i < num_lines; i++) {
+        size_t len = strlen(lines[i]);
+        for (size_t j = 0; j < len; j++) {
+            set_char(x + j, y + i, lines[i][j]);
+            set_colour(x + j, y + i, current_fg, current_bg);
+        }
+    }
+
+    request_swap();
+}
+
+void new_line(void) {
+    set_char(term.cursor_x, term.cursor_y, ' ');
+    set_colour(term.cursor_x, term.cursor_y, current_fg, current_bg);
+    term.cursor_x = 0;
+    if (++term.cursor_y >= CHAR_ROWS) {
+        scroll_requested = true;
+        term.cursor_y = CHAR_ROWS - 1;
+    }
+}
+
+// === Terminal Functions ===
+void handle_char(char c) {
+    if (term.skip_next_lf && c == '\n') {
+        term.skip_next_lf = false;
+        return;
+    }
+
+    if (term.escape_mode) {
+        if (c == '[') {
+            term.ansi_mode = true;
+            reset_ansi_state();
+            return;
+        }
+        if (term.ansi_mode) {
+            if (c >= '0' && c <= '9') {
+                if (ansi_buf_len < sizeof(ansi_buffer) - 1) {
+                    ansi_buffer[ansi_buf_len++] = c;
+                }
+                return;
+            } else if (c == ';') {
+                ansi_buffer[ansi_buf_len] = '\0';
+                if (ansi_param_count < ANSI_PARAM_MAX) {
+                    ansi_params[ansi_param_count++] = atoi(ansi_buffer);
+                }
+                ansi_buf_len = 0;
+                return;
+            } else {
+                ansi_buffer[ansi_buf_len] = '\0';
+                if (ansi_buf_len > 0 && ansi_param_count < ANSI_PARAM_MAX) {
+                    ansi_params[ansi_param_count++] = atoi(ansi_buffer);
+                }
+                process_ansi_sequence(ansi_params, ansi_param_count, c);
+                term.escape_mode = false;
+                term.ansi_mode = false;
+                return;
+            }
+        }
+
+        term.escape_mode = false;
+        return;
+    }
+
+    // Cursor style menu override
+    if (cursor_menu_mode) {
+        switch (c) {
+        case '1':
+            current_cursor = CURSOR_APPLE_II;
+            break;
+        case '2':
+            current_cursor = CURSOR_UNDERLINE;
+            break;
+        case '3':
+            current_cursor = CURSOR_BAR;
+            break;
+        case '4':
+            current_cursor = CURSOR_APPLE_I;
+            break;
+        default:
+            return;
+        }
+        cursor_menu_mode = false;
+        restore_menu_region(); // Restores screen
+        term.cursor_visible = true;
+        next_cursor_blink = get_absolute_time(); // Forces blink
+        return;
+    }
+
+    // Theme select mode override
+    if (theme_select_mode) {
+        bool applied = true;
+        switch (c) {
+        case '1':
+            current_fg = 12;
+            current_bg = 0;
+            break; // IBM GreenScreen
+        case '2':
+            current_fg = 60;
+            current_bg = 0;
+            break; // VT Amber
+        case '3':
+            current_fg = 15;
+            current_bg = 5;
+            break; // ANSI Cyan
+        case '4':
+            current_fg = 63;
+            current_bg = 0;
+            break; // DOS Classic
+        case '5':
+            current_fg = 3;
+            current_bg = 0;
+            break; // Electric Blue
+        case '6':
+            current_fg = 48;
+            current_bg = 21;
+            break; // Mainframe Red
+        case '7':
+            current_fg = 51;
+            current_bg = 0;
+            break; // Magenta Spark
+        case '8':
+            current_fg = 0;
+            current_bg = 12;
+            break; // Matrix Inverse
+        case '9':
+            current_fg = 6;
+            current_bg = 11;
+            break; // Teal & Indigo
+        default:
+            applied = false;
+            break;
+        }
+        if (applied)
+            theme_select_mode = false;
+        return;
+    }
+
+    // Normal character handling
+    switch (c) {
+    case '\x14':
+        theme_select_mode = true;
+        break; // Ctrl+T: T
+
+Part 7
+heme mode
+    case '\x0E':
+        cursor_menu_mode = true;
+        draw_cursor_menu();
+        break; // Ctrl+M: Cursor menu
+
+    case '\x07':
+        current_fg = 12;
+        current_bg = 0;
+        break; // Ctrl+G: Green
+    case '\x17':
+        current_fg = 63;
+        current_bg = 0;
+        break; // Ctrl+W: White
+    case '\x02':
+        current_fg = 3;
+        break; // Ctrl+B: Blue
+    case '\x03':
+        current_fg = 15;
+        break; // Ctrl+C: Cyan
+    case '\x04':
+        current_fg = 4;
+        break; // Ctrl+D: Dark Green
+    case '\x0F':
+        current_fg = 48;
+        break; // Ctrl+O: Orange
+    case '\x12':
+        current_fg = 48;
+        break; // Ctrl+R: Red
+    case '\x13':
+        current_fg = 51;
+        break; // Ctrl+S: Magenta
+    case '\x19':
+        current_fg = 60;
+        break; // Ctrl+Y: Yellow
+    case '\x0C':
+        current_fg = 21;
+        break; // Ctrl+L: Light Gray
+
+    case '\x1B':
+        term.escape_mode = true;
+        break;
+    case '\r':
+        new_line();
+        term.skip_next_lf = true;
+        break;
+    case '\n':
+        new_line();
+        break;
+    case '\b': {
+        if (term.cursor_x > 0) {
+            // Erase cursor glyph if visible
+            if (cursor_drawn) {
+                set_char(term.cursor_x, term.cursor_y, saved_cursor_char);
+                set_colour(term.cursor_x, term.cursor_y, saved_cursor_fg, saved_cursor_bg);
+                cursor_drawn = false;
+            }
+
+            // Move back one cell
+            term.cursor_x--;
+
+            // Clear that cell content (overwrite with space)
+            set_char(term.cursor_x, term.cursor_y, ' ');
+            set_colour(term.cursor_x, term.cursor_y, current_fg, current_bg);
+
+            // Refresh what's under the cursor
+            uint idx = term.cursor_x + term.cursor_y * CHAR_COLS;
+            saved_cursor_char = charbuf_back[idx];
+            uint bit = (idx % 8) * 4;
+            uint word = idx / 8;
+
+            uint8_t fg = 0, bg = 0;
+            for (int p = 2; p >= 0; --p) {
+                uint32_t val = colourbuf_back[word + p * COLOUR_PLANE_SIZE_WORDS];
+                uint8_t nibble = (val >> bit) & 0xF;
+                fg = (fg << 2) | (nibble & 0x3);
+                bg = (bg << 2) | ((nibble >> 2) & 0x3);
+            }
+
+            saved_cursor_fg = fg;
+            saved_cursor_bg = bg;
+
+            term.cursor_visible = false;
+            next_cursor_blink = delayed_by_us(get_absolute_time(), 500000);
+            request_swap();
+        }
+        break;
+    }
+
+    default:
+        if (c >= 32 && c < 127) {
+            // Step 1: Erase cursor glyph if drawn
+            if (cursor_drawn) {
+                set_char(term.cursor_x, term.cursor_y, saved_cursor_char);
+                set_colour(term.cursor_x, term.cursor_y, saved_cursor_fg, saved_cursor_bg);
+                cursor_drawn = false;
+            }
+
+            // Step 2: Write new character
+            set_char(term.cursor_x, term.cursor_y, c);
+            set_colour(term.cursor_x, term.cursor_y, current_fg, current_bg);
+
+            // Step 3: Update saved character at new cursor location
+            saved_cursor_char = c;
+            saved_cursor_fg = current_fg;
+            saved_cursor_bg = current_bg;
+
+            // Step 4: Reset cursor blink
+            term.cursor_visible = false;
+            next_cursor_blink = delayed_by_us(get_absolute_time(), 500000);
+
+            // Step 5: Advance cursor
+            if (++term.cursor_x >= CHAR_COLS)
+                new_line();
+        }
+        break;
+    }
+
+    request_swap();
+}
+// === Rendering Core ===
+
+void scroll_up(void) {
+    while (__atomic_load_n(&buffer_lock, __ATOMIC_ACQUIRE)) {
+        __wfi();
+    }
+    while (__atomic_test_and_set(&buffer_lock, __ATOMIC_ACQUIRE)) {
+    }
+
+    for (uint y = 1; y < CHAR_ROWS; y++) {
+        memcpy(&charbuf_back[(y - 1) * CHAR_COLS], &charbuf_back[y * CHAR_COLS], CHAR_COLS);
+    }
+
+    for (int plane = 0; plane < 3; ++plane) {
+        ui
+
+Part 8
+nt32_t *base = &colourbuf_back[plane * COLOUR_PLANE_SIZE_WORDS];
+        for (uint y = 1; y < CHAR_ROWS; y++) {
+            memcpy(&base[(y - 1) * (CHAR_COLS / 8)], &base[y * (CHAR_COLS / 8)],
+                   (CHAR_COLS / 8) * sizeof(uint32_t));
+        }
+    }
+
+    memset(&charbuf_back[(CHAR_ROWS - 1) * CHAR_COLS], ' ', CHAR_COLS);
+    for (uint x = 0; x < CHAR_COLS; x++)
+        set_colour(x, CHAR_ROWS - 1, current_fg, current_bg);
+
+    __atomic_clear(&buffer_lock, __ATOMIC_RELEASE);
+    scroll_swap_requested = true;
+}
+
+void perform_swap(void) {
+    while (__atomic_test_and_set(&buffer_lock, __ATOMIC_ACQUIRE)) {
+    }
+    memcpy(charbuf_front, charbuf_back, sizeof(charbuf_back));
+    memcpy(colourbuf_front, colourbuf_back, sizeof(colourbuf_back));
+    __atomic_clear(&buffer_lock, __ATOMIC_RELEASE);
+    swap_pending = false;
+}
+
+void draw_sprite(uint x, uint y, const char sprite[8][8], uint8_t fg, uint8_t bg) {
+    for (int dy = 0; dy < 8; dy++) {
+        for (int dx = 0; dx < 8; dx++) {
+            if (sprite[dy][dx] == '#') {
+                set_char(x + dx, y + dy, ' ');
+                set_colour(x + dx, y + dy, fg, bg);
+            }
+        }
+    }
+}
+
+static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
+    if (event == I2C_SLAVE_RECEIVE) {
+        while (i2c_get_read_available(i2c)) {
+            uint8_t c = i2c_read_byte_raw(i2c);
+
+            // Route through existing char handler
+            handle_char((char)c);
+            gpio_put(LED_PIN, 1);  // Same feedback as UART
+            led_off_time = make_timeout_time_ms(30);
+        }
+    }
+}
+
+
+void core1_main(void) {
+    dvi_register_irqs_this_core(&dvi0, DMA_IRQ_0);
+    dvi_start(&dvi0);
+
+    while (1) {
+        for (uint y = 0; y < FRAME_HEIGHT; y++) {
+            if (y == 0) {
+                if (swap_pending && !suppress_swap_frame) {
+                    perform_swap();
+                } else if (suppress_swap_frame) {
+                    suppress_swap_frame = false;  // Skip one frame to ensure buffers are fully clean
+                }
+            }
+            uint32_t *tmdsbuf;
+            queue_remove_blocking(&dvi0.q_tmds_free, &tmdsbuf);
+
+            while (__atomic_load_n(&buffer_lock, __ATOMIC_ACQUIRE)) {
+            }
+
+            uint row = y / FONT_CHAR_HEIGHT;
+            if (row >= CHAR_ROWS)
+                row = CHAR_ROWS - 1;
+
+            uint font_y = y % FONT_CHAR_HEIGHT;
+            const uint8_t *scanline = &font_scanline[font_y * FONT_N_CHARS];
+
+            for (int plane = 0; plane < 3; plane++) {
+                tmds_encode_font_2bpp((const uint8_t *)&charbuf_front[row * CHAR_COLS],
+                                      &colourbuf_front[row * (COLOUR_PLANE_SIZE_WORDS / CHAR_ROWS) +
+                                                       plane * COLOUR_PLANE_SIZE_WORDS],
+                                      tmdsbuf + plane * (FRAME_WIDTH / DVI_SYMBOLS_PER_WORD),
+                                      FRAME_WIDTH, scanline);
+            }
+
+            queue_add_blocking(&dvi0.q_tmds_valid, &tmdsbuf);
+        }
+    }
+}
+
+int main(void) {
+    uint bauddiv = 0;
+    stdio_init_all();
+    sleep_ms(2000); // Allow USB serial to stabilize
+    uart_init(UART_ID, BAUD_RATE);
+    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+    uart_set_format(UART_ID, 8, 1, UART_PARITY_NONE);
+    uart_set_fifo_enabled(UART_ID, true);
+    //const uint LED_PIN = PICO_DEFAULT_LED_PIN;
+    gpio_init(LED_PIN);
+    gpio_set_dir(LED_PIN, GPIO_OUT);
+    gpio_put(LED_PIN, 1);
+    i2c_init(I2C_SLAVE, I2C_BAUD_RATE);
+    gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA_PIN);
+    gpio_pull_up(I2C_SCL_PIN);
+    i2c_slave_init(I2C_SLAVE, I2C_SLAVE_ADDR, &i2c_slave_handler);
+
+
+    // Clock & DVI setup
+    vreg_set_voltage(VREG_VSEL);
+    sleep_ms(10);
+    //set_sys_clock_khz(DVI_TIMING.bit_clk_khz, true);
+    dvi0.timing = &DVI_TIMING
+
+Part 9
+;
+    dvi0.ser_cfg = DVI_DEFAULT_SERIAL_CONFIG;
+    dvi_init(&dvi0, next_striped_spin_lock_num(), next_striped_spin_lock_num());
+
+    // Terminal state
+    memset(&term, 0, sizeof(term));
+    term.cursor_visible = true;
+
+    // Font init
+    for (uint16_t ch = 0; ch < FONT_N_CHARS; ++ch) {
+        for (uint8_t row = 0; row < FONT_CHAR_HEIGHT; ++row) {
+            bool should_reverse = (ch < 128);
+            uint8_t byte = font_8x16[ch][row];
+            font_scanline[row * FONT_N_CHARS + ch] = should_reverse ? reverse_byte(byte) : byte;
+        }
+    }
+
+    clear_screen();
+    perform_swap();
+    scroll_up();
+    scroll_requested = false;
+    scroll_swap_requested = false;
+    request_swap();
+
+    // Launch rendering core
+    hw_set_bits(&bus_ctrl_hw->priority, BUSCTRL_BUS_PRIORITY_PROC1_BITS);
+    multicore_launch_core1(core1_main);
+
+    next_cursor_blink = get_absolute_time();
+
+    while (true) {
+        absolute_time_t now = get_absolute_time();
+
+        // Cursor blink (glyph draw/erase)
+        if (absolute_time_diff_us(next_cursor_blink, now) >= 0) {
+            char cursor_char = ' ';
+            switch (current_cursor) {
+            case CURSOR_APPLE_II:
+                cursor_char = ']';
+                break;
+            case CURSOR_UNDERLINE:
+                cursor_char = '_';
+                break;
+            case CURSOR_BAR:
+                cursor_char = '|';
+                break;
+            case CURSOR_APPLE_I:
+                cursor_char = '@';
+                break;
+            }
+
+            if (term.cursor_visible) {
+                uint idx = term.cursor_x + term.cursor_y * CHAR_COLS;
+                cursor_draw_x = term.cursor_x;
+                cursor_draw_y = term.cursor_y;
+
+                saved_cursor_char = charbuf_back[idx];
+                // Extract color from buffer like you're doing in backspace
+                uint bit = (idx % 8) * 4;
+                uint word = idx / 8;
+
+                uint8_t fg = 0, bg = 0;
+                for (int p = 2; p >= 0; --p) {
+                    uint32_t val = colourbuf_back[word + p * COLOUR_PLANE_SIZE_WORDS];
+                    uint8_t nibble = (val >> bit) & 0xF;
+                    fg = (fg << 2) | (nibble & 0x3);
+                    bg = (bg << 2) | ((nibble >> 2) & 0x3);
+                }
+                saved_cursor_fg = fg;
+                saved_cursor_bg = bg;
+
+                set_char(term.cursor_x, term.cursor_y, cursor_char);
+                set_colour(term.cursor_x, term.cursor_y, current_fg, current_bg);
+                cursor_drawn = true;
+            } else {
+                // Only restore if cursor was last drawn at current position
+                if (cursor_draw_x == term.cursor_x && cursor_draw_y == term.cursor_y) {
+                    set_char(term.cursor_x, term.cursor_y, saved_cursor_char);
+                    set_colour(term.cursor_x, term.cursor_y, saved_cursor_fg, saved_cursor_bg);
+                }
+                cursor_drawn = false;
+            }
+
+            request_swap();
+            term.cursor_visible = !term.cursor_visible;
+            next_cursor_blink = delayed_by_us(now, 500000);
+        }
+        int c = PICO_ERROR_TIMEOUT;
+        
+        // 🟢 Check UART input first
+        if (uart_is_readable(uart0)) {
+            c = uart_getc(uart0);
+        }
+        
+        // 🔵 If no UART input, check USB console
+        else {
+            c = getchar_timeout_us(0);  // USB stdio
+        }
+        
+        if (c != PICO_ERROR_TIMEOUT) {
+            gpio_put(LED_PIN, 1);
+            led_off_time = make_timeout_time_ms(30);
+            handle_char((char)c);
+        }
+        
+        if (time_reached(led_off_time)) {
+            gpio_put(LED_PIN, 0);
+        }
+
+//        // Input handling
+//        //int c = getchar_timeout_us(0);
+//        int c = uart_is_readable(uart0) ? uart_getc(uart0) : PICO_ERROR_TIMEOUT;
+//        if (c != PICO_ERROR_TIMEOUT) {
+//            gpio_put(LED_PIN, 1);
+//            led_off_time = make_timeou
+
+Part 10
+t_time_ms(30);
+//            handle_char((char)c);
+//        }
+//
+//        if (absolute_time_diff_us(get_absolute_time(), led_off_time) <= 0) {
+//            gpio_put(LED_PIN, 0);
+//        }
+
+        if (scroll_requested && !swap_pending) {
+            scroll_up();
+            scroll_requested = false;
+        }
+
+        if (scroll_swap_requested) {
+            request_swap();
+            scroll_swap_requested = false;
+        }
+
+        request_swap();
+        sleep_ms(1);
+    }
+}
+
+
