@@ -1,5 +1,7 @@
 # PicoDVI-UART-Terminal
 
+![PicoDVI_UART](img/PicoDVI_UART.jpg)
+
 This project is a specialized DVI terminal emulator for the Raspberry Pi Pico RP2350, building upon the original [PicoDVI](https://github.com/Wren6991/PicoDVI) project. It provides a robust text-based console experience leveraging the Pico's DVI output capabilities and a UART interface for input.
 
 **Author:** Donald R. Moran
