@@ -20,7 +20,7 @@ This project is a specialized DVI terminal emulator for the Raspberry Pi Pico RP
 ## Hardware Requirements
 
 *   Raspberry Pi Pico RP2350
-*   DVI output board (e.g., [Adafruit DVI Sock for Pico](https://learn.adafruit.com/adafruit-dvi-sock-for-pico-works-with-hdmi-displays)). This project is configured for the Adafruit DVI Sock using the following Raspberry Pi Pico GPIO pins:
+*   DVI output board (e.g., [Adafruit DVI Sock for Pico](https://learn.adafruit.com/adafruit-dvi-sock-for-pico-works-with-hdmi-displays)). This project is configured for a DVI breakout board similar to the Adafruit DVI Breakout Board found at [https://learn.adafruit.com/adafruit-dvi-breakout-board/raspberry-pi-pico-demo-code](https://learn.adafruit.com/adafruit-dvi-breakout-board/raspberry-pi-pico-demo-code). The pin configuration used in this project's `adafruit_hdmi_sock_cfg` matches the positive differential pairs and clock pin on that breakout board:
     *   **D0 (Red):** GP12
     *   **D1 (Green):** GP18
     *   **D2 (Blue):** GP16
