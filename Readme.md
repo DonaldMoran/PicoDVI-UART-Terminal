@@ -16,14 +16,14 @@ Key features of this terminal emulator include:
 
 This project aims to provide a ready-to-use terminal application built upon the robust PicoDVI library, making it easy to integrate a visual console into your RP2350 projects.
 
+If you plan to run the `vista` demo, then note that there are now two UF2 data files, `software/assets/vista_data_rp2040.uf2` and `software/assets/vista_data_rp2350.uf2`. The only difference is the family IDs: the first can be dragged on RP2040 and on RP2350 A0, and the second can be dragged on RP2350 A1 and later.
+
 Changes from the public GitHub version:
 
 * All Arm assembly in `libdvi` has been ported to RISC-V and tuned for Hazard3
 * Some of the existing Arm assembly in `libdvi` has been tweaked for better performance on Cortex-M33
 * RGB encode now uses the SIO TMDS encoders by default on RP2350 (can be disabled by defining `DVI_USE_SIO_TMDS_ENCODE=0` -- see `software/libdvi/dvi_config_defs.h`)
 * Much of the Arm assembly in `libsprite` has been ported to RISC-V -- enough to run the stock demos
-
-If you plan to run the `vista` demo, then note that there are now two UF2 data files, `software/assets/vista_data_rp2040.uf2` and `software/assets/vista_data_rp2350.uf2`. The only difference is the family IDs: the first can be dragged on RP2040 and on RP2350 A0, and the second can be dragged on RP2350 A1 and later.
 
 Build instructions:
 
