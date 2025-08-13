@@ -23,6 +23,8 @@ Changes from the public GitHub version:
 * RGB encode now uses the SIO TMDS encoders by default on RP2350 (can be disabled by defining `DVI_USE_SIO_TMDS_ENCODE=0` -- see `software/libdvi/dvi_config_defs.h`)
 * Much of the Arm assembly in `libsprite` has been ported to RISC-V -- enough to run the stock demos
 
+If you plan to run the `vista` demo, then note that there are now two UF2 data files, `software/assets/vista_data_rp2040.uf2` and `software/assets/vista_data_rp2350.uf2`. The only difference is the family IDs: the first can be dragged on RP2040 and on RP2350 A0, and the second can be dragged on RP2350 A1 and later.
+
 Build instructions:
 
 ```bash
@@ -35,8 +37,6 @@ make -j$(nproc)
 # Then flash a binary, e.g.:
 cp apps/tiles_and_sprites/tiles_and_sprites.uf2
 ```
-
-If you plan to run the `vista` demo, then note that there are now two UF2 data files, `software/assets/vista_data_rp2040.uf2` and `software/assets/vista_data_rp2350.uf2`. The only difference is the family IDs: the first can be dragged on RP2040 and on RP2350 A0, and the second can be dragged on RP2350 A1 and later.
 
 The following is the original RP2040 writeup:
 
