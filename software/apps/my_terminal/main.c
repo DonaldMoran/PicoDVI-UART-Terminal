@@ -23,15 +23,6 @@ Key Features:
   - VSYNC-synchronized rendering
   - Terminal state preservation during menu operations
   - Interactive color selection menus for both foreground and background colors (Ctrl+F, Ctrl+B)
-  - ANSI escape code support for blinking text (ESC[5m to enable, ESC[25m to disable)
-  - Vertical scrolling when new lines exceed screen height
-  - Watchdog timer for system stability
-  - Multicore processing (Core0 for logic, Core1 for DVI rendering)
-  - ANSI escape codes for cursor positioning and movement (e.g., ESC[<row>;<col>H, ESC[A, ESC[B, ESC[C, ESC[D])
-  - ANSI escape codes for screen and line erasing (e.g., ESC[2J, ESC[K)
-  - ANSI escape codes for saving and restoring cursor position (ESC[s, ESC[u)
-  - UART receive buffer overflow detection
-  - Interactive theme selection presets (Ctrl+T)
 
 Color System:
   The terminal uses 6-bit RGB colors (2 bits per component) for a total of 64 colors.
@@ -150,13 +141,6 @@ __attribute__((aligned(4))) static char charbuf_back[CHAR_ROWS * CHAR_COLS];
 __attribute__((aligned(4))) static uint32_t colourbuf_front[3 * COLOUR_PLANE_SIZE_WORDS + COLOUR_PAD_WORDS];
 __attribute__((aligned(4))) static uint32_t colourbuf_back[3 * COLOUR_PLANE_SIZE_WORDS + COLOUR_PAD_WORDS];
 
-// Blinking text buffers and state
-__attribute__((aligned(4))) static bool blink_attribute_front[CHAR_ROWS * CHAR_COLS];
-__attribute__((aligned(4))) static bool blink_attribute_back[CHAR_ROWS * CHAR_COLS];
-static volatile bool blink_on = true;
-static uint32_t blink_timer = 0;
-#define BLINK_INTERVAL_MS 500
-
 static volatile bool buffer_lock = false;
 volatile bool swap_pending = false;
 volatile bool scroll_settled = true;
@@ -179,7 +163,6 @@ typedef struct {
     bool skip_next_lf;
     bool skip_next_cr;
     bool suppress_next_cr;
-    bool blink_mode; // Added for ANSI blinking
 } terminal_state_t;
 
 terminal_state_t term;
@@ -254,7 +237,7 @@ uint8_t reverse_byte(uint8_t b) {
 
 void reset_ansi_state(void) {
     ansi_param_count = 0;
-    // ansi_param_index = 0;
+    ansi_param_index = 0;
     ansi_buf_len = 0;
     ansi_final_char = '\0';
 }
@@ -277,7 +260,6 @@ void perform_swap(void) {
     
     memcpy(charbuf_front, charbuf_back, sizeof(charbuf_back));
     memcpy(colourbuf_front, colourbuf_back, sizeof(colourbuf_back));
-    memcpy(blink_attribute_front, blink_attribute_back, sizeof(blink_attribute_back)); // Copy blink attributes
     
     __atomic_clear(&buffer_lock, __ATOMIC_RELEASE);
     swap_pending = false;
@@ -301,13 +283,6 @@ void safe_request_swap(void) {
 void set_char(uint x, uint y, uint8_t c) {
     if (x < CHAR_COLS && y < CHAR_ROWS) {
         charbuf_back[x + y * CHAR_COLS] = c;
-        blink_attribute_back[x + y * CHAR_COLS] = false; // Default to not blinking
-    }
-}
-
-void set_blink_attribute(uint x, uint y, bool blink) {
-    if (x < CHAR_COLS && y < CHAR_ROWS) {
-        blink_attribute_back[x + y * CHAR_COLS] = blink;
     }
 }
 
@@ -339,13 +314,11 @@ void clear_screen(void) {
     }
     
     memset(colourbuf_back, 0, sizeof(colourbuf_back));
-    memset(blink_attribute_back, 0, sizeof(blink_attribute_back)); // Clear blink attributes
     
     for (uint y = 0; y < CHAR_ROWS; y++) {
         for (uint x = 0; x < CHAR_COLS; x++) {
             charbuf_back[x + y * CHAR_COLS] = ' ';
             set_colour(x, y, current_fg, current_bg);
-            blink_attribute_back[x + y * CHAR_COLS] = false; // Ensure no blinking by default
         }
     }
     
@@ -365,21 +338,11 @@ void scroll_up(void) {
             &charbuf_back[CHAR_COLS], 
             (CHAR_ROWS - 1) * CHAR_COLS);
     
-    // Shift blink attribute buffer
-    memmove(&blink_attribute_back[0],
-            &blink_attribute_back[CHAR_COLS],
-            (CHAR_ROWS - 1) * CHAR_COLS * sizeof(bool));
-
     // Clear the last row of characters
     for (uint x = 0; x < CHAR_COLS; x++) {
         charbuf_back[x + (CHAR_ROWS - 1) * CHAR_COLS] = ' ';
     }
     
-    // Clear the last row of blink attributes
-    for (uint x = 0; x < CHAR_COLS; x++) {
-        blink_attribute_back[x + (CHAR_ROWS - 1) * CHAR_COLS] = false;
-    }
-
     // Shift color buffer for all planes
     for (int p = 0; p < 3; p++) {
         uint32_t *base = &colourbuf_back[p * COLOUR_PLANE_SIZE_WORDS];
@@ -424,10 +387,9 @@ void new_line(void) {
 // (2 bits per component: R, G, B)
 void process_ansi_code(uint8_t param) {
     if (param == 0) {
-        // Reset: white on black, no blinking
+        // Reset: white on black
         current_fg = 63;  // 0b111111
         current_bg = 0;   // 0b000000
-        term.blink_mode = false; // Reset blinking
     } else if (param >= 30 && param <= 37) {
         // Standard ANSI foreground colors
         static const uint8_t ansi_colors[] = {
@@ -454,10 +416,6 @@ void process_ansi_code(uint8_t param) {
             63   // 47: white
         };
         current_bg = ansi_colors[param - 40];
-    } else if (param == 5) {
-        term.blink_mode = true; // Enable blinking
-    } else if (param == 25) {
-        term.blink_mode = false; // Disable blinking
     }
 }
 
@@ -504,29 +462,38 @@ void process_ansi_sequence(uint8_t *params, uint8_t count, char final) {
         }
         break;
         
-    case 'A':
-        if (term.cursor_y > 0) {
-            term.cursor_y--;
+        case 'A': { // Cursor Up
+            uint8_t n = (count >= 1 && params[0] > 0) ? params[0] : 1;
+            if (term.cursor_y >= n)
+                term.cursor_y -= n;
+            else
+                term.cursor_y = 0;
+            break;
         }
-        break;
-        
-    case 'B':
-        if (term.cursor_y < CHAR_ROWS - 1) {
-            term.cursor_y++;
+        case 'B': { // Cursor Down
+            uint8_t n = (count >= 1 && params[0] > 0) ? params[0] : 1;
+            if (term.cursor_y + n < CHAR_ROWS)
+                term.cursor_y += n;
+            else
+                term.cursor_y = CHAR_ROWS - 1;
+            break;
         }
-        break;
-        
-    case 'C':
-        if (term.cursor_x < CHAR_COLS - 1) {
-            term.cursor_x++;
+        case 'C': { // Cursor Forward
+            uint8_t n = (count >= 1 && params[0] > 0) ? params[0] : 1;
+            if (term.cursor_x + n < CHAR_COLS)
+                term.cursor_x += n;
+            else
+                term.cursor_x = CHAR_COLS - 1;
+            break;
         }
-        break;
-        
-    case 'D':
-        if (term.cursor_x > 0) {
-            term.cursor_x--;
+        case 'D': { // Cursor Back
+            uint8_t n = (count >= 1 && params[0] > 0) ? params[0] : 1;
+            if (term.cursor_x >= n)
+                term.cursor_x -= n;
+            else
+                term.cursor_x = 0;
+            break;
         }
-        break;
     }
 }
 
@@ -934,7 +901,6 @@ void handle_char(char c) {
         // Handle normal character input
         set_char(term.cursor_x, term.cursor_y, c);
         set_colour(term.cursor_x, term.cursor_y, current_fg, current_bg);
-        set_blink_attribute(term.cursor_x, term.cursor_y, term.blink_mode); // Set blink attribute
         term.cursor_x++;
         buffer_dirty = true;
         if (term.cursor_x >= CHAR_COLS) {
@@ -1066,19 +1032,8 @@ void core1_main(void) {
             uint font_y = y % FONT_CHAR_HEIGHT;
             const uint8_t *scanline = &font_scanline[font_y * FONT_N_CHARS];
             
-            // Create a temporary char buffer for the current scanline, applying blinking logic
-            char temp_charbuf_row[CHAR_COLS];
-            for (uint i = 0; i < CHAR_COLS; ++i) {
-                uint char_idx = row * CHAR_COLS + i;
-                if (blink_attribute_front[char_idx] && !blink_on) {
-                    temp_charbuf_row[i] = ' '; // Hide character if blinking and blink_on is false
-                } else {
-                    temp_charbuf_row[i] = charbuf_front[char_idx];
-                }
-            }
-
             for (int plane = 0; plane < 3; plane++) {
-                tmds_encode_font_2bpp((const uint8_t *)temp_charbuf_row,
+                tmds_encode_font_2bpp((const uint8_t *)&charbuf_front[row * CHAR_COLS],
                                       &colourbuf_front[row * (COLOUR_PLANE_SIZE_WORDS / CHAR_ROWS) +
                                                        plane * COLOUR_PLANE_SIZE_WORDS],
                                       tmdsbuf + plane * (FRAME_WIDTH / DVI_SYMBOLS_PER_WORD),
@@ -1136,7 +1091,6 @@ int main(void) {
     term.cursor_visible = true;
     term.cursor_x = 0;
     term.cursor_y = 0;
-    term.blink_mode = false; // Initialize blink mode to off
     cursor_draw_x = 0;
     cursor_draw_y = 0;
     saved_cursor_x = 0;
@@ -1144,8 +1098,6 @@ int main(void) {
     
     clear_screen();
     perform_swap();
-
-    
 
     // Set bus priority for core1
     bus_ctrl_hw->priority = BUSCTRL_BUS_PRIORITY_PROC1_BITS;
@@ -1217,14 +1169,6 @@ int main(void) {
                 }
                 #endif
             }
-        }
-
-        // Text blinking logic
-        if (time_us_32() - blink_timer >= BLINK_INTERVAL_MS * 1000) {
-            blink_on = !blink_on;
-            blink_timer = time_us_32();
-            buffer_dirty = true; // Mark buffer dirty to force a swap and redraw
-            safe_request_swap();
         }
         
         // Process UART input
